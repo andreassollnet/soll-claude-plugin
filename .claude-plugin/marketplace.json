@@ -1,0 +1,14 @@
+{
+  "name": "soll-net",
+  "description": "Plugins of soll.net (Soll IT Consulting): domains, DNS and web hosting for Claude.",
+  "owner": { "name": "Soll IT Consulting", "email": "support@soll.net" },
+  "plugins": [
+    {
+      "name": "soll",
+      "source": "./",
+      "description": "Publish websites and web apps to soll.net web hosting with one sentence.",
+      "version": "0.1.0",
+      "category": "deployment"
+    }
+  ]
+}

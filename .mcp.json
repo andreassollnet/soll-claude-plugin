@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "soll": {
+      "type": "http",
+      "url": "https://api.soll.net/mcp"
+    }
+  }
+}

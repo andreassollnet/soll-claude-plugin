@@ -1,0 +1,11 @@
+{
+  "name": "soll",
+  "displayName": "soll.net Publish",
+  "version": "0.1.0",
+  "description": "Publish websites and web apps built with AI to soll.net web hosting with one sentence: framework detection, secret scan, upload, live URL, rollback.",
+  "author": { "name": "Soll IT Consulting", "email": "support@soll.net", "url": "https://soll.net/" },
+  "homepage": "https://soll.net/",
+  "repository": "https://github.com/andreassollnet/soll-claude-plugin",
+  "license": "MIT",
+  "keywords": ["soll.net", "hosting", "deploy", "publish", "static site", "php", "mcp"]
+}
