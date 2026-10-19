@@ -1,18 +1,21 @@
 #!/usr/bin/env node
 // Packs a build output folder into a tar.gz (regular files only, the folder's contents at the top) and reports the
 // size and SHA-256 that hosting_deployments_create needs. Written in plain Node.js, so it works without a tar binary.
-// Usage: node pack.mjs <outputDir> [archivePath]  ->  JSON {archive, bytes, sha256, files}.
+// Leaves out what never belongs on a web server (rules.mjs: version control, editor and tool folders, .env files, dumps,
+// logs) and refuses paths the server would refuse.
+// Usage: node pack.mjs <outputDir> [archivePath] [--max-bytes N]
+//   ->  JSON {archive, url_file, bytes, sha256, files, excluded_count, format}; exit 1 with {error, code} on failure.
 
 import { createHash } from 'node:crypto';
-import { createReadStream, createWriteStream, lstatSync, mkdtempSync, readdirSync } from 'node:fs';
+import { createReadStream, createWriteStream, lstatSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative, sep } from 'node:path';
+import { dirname, join, relative, sep } from 'node:path';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
-import { pathToFileURL } from 'node:url';
 import { createGzip } from 'node:zlib';
+import { exclusionReason, isMain, LIMITS, pathProblem } from './rules.mjs';
 
-const SKIP = new Set(['.git', '.DS_Store', 'Thumbs.db', '.soll']);
+const fail = (code, message, extra = {}) => Object.assign(new Error(message), { code, ...extra });
 
 function header(name, size, type = '0') {
   const block = Buffer.alloc(512, 0);
@@ -34,17 +37,23 @@ function header(name, size, type = '0') {
 
 const padding = (size) => Buffer.alloc((512 - (size % 512)) % 512, 0);
 
-/** The regular files below dir, relative paths with "/". */
-export function listFiles(dir) {
+/** The regular files below dir, relative paths with "/", without links and excluded entries. */
+export function listFiles(dir, excluded = []) {
   const files = [];
   const walk = (current) => {
     for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
-      if (SKIP.has(entry.name)) continue;
       const path = join(current, entry.name);
       const stat = lstatSync(path);
       if (stat.isSymbolicLink()) continue;
+      const name = relative(dir, path).split(sep).join('/');
+      if (exclusionReason(entry.name, stat.isDirectory())) {
+        excluded.push(stat.isDirectory() ? `${name}/` : name);
+        continue;
+      }
+      const problem = pathProblem(name);
+      if (problem) throw fail(problem.code, `${name}: ${problem.message}`);
       if (stat.isDirectory()) walk(path);
-      else if (stat.isFile()) files.push({ path, name: relative(dir, path).split(sep).join('/'), size: stat.size });
+      else if (stat.isFile()) files.push({ path, name, size: stat.size });
     }
   };
   walk(dir);
@@ -73,29 +82,52 @@ async function* tarChunks(files) {
   yield Buffer.alloc(1024, 0);
 }
 
-export async function pack(outputDir, archivePath) {
-  const files = listFiles(outputDir);
-  if (files.length === 0) throw new Error('The output folder is empty.');
-  const target = archivePath ?? join(mkdtempSync(join(tmpdir(), 'soll-publish-')), 'site.tar.gz');
-  await pipeline(Readable.from(tarChunks(files)), createGzip({ level: 6 }), createWriteStream(target));
+/**
+ * Packs outputDir. maxBytes: the server's archive limit (hosting_get deployments.max_archive_bytes); a larger archive
+ * is deleted and refused with ARCHIVE_TOO_LARGE.
+ */
+export async function pack(outputDir, archivePath, { maxBytes = LIMITS.maxArchiveBytes } = {}) {
+  const excluded = [];
+  const files = listFiles(outputDir, excluded);
+  if (files.length === 0) throw fail('EMPTY', 'The output folder is empty.');
+  const tempDir = archivePath ? null : mkdtempSync(join(tmpdir(), 'soll-publish-'));
+  const target = archivePath ?? join(tempDir, 'site.tar.gz');
+  const discard = () => rmSync(tempDir ?? target, { recursive: true, force: true });
+  try {
+    await pipeline(Readable.from(tarChunks(files)), createGzip({ level: 6 }), createWriteStream(target));
+  } catch (error) {
+    discard();
+    throw error;
+  }
   const hash = createHash('sha256');
   let bytes = 0;
   for await (const chunk of createReadStream(target)) {
     hash.update(chunk);
     bytes += chunk.length;
   }
-  return { archive: target, bytes, sha256: hash.digest('hex'), files: files.length, format: 'tar.gz' };
+  if (bytes > maxBytes) {
+    discard();
+    throw fail('ARCHIVE_TOO_LARGE', `The archive has ${(bytes / 1048576).toFixed(1)} MB; the hosting accepts at most ${(maxBytes / 1048576).toFixed(0)} MB.`, { bytes, max_bytes: maxBytes });
+  }
+  return {
+    archive: target, url_file: join(dirname(target), 'upload-url'), bytes, sha256: hash.digest('hex'), files: files.length,
+    excluded_count: excluded.length, format: 'tar.gz',
+  };
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
-  if (!process.argv[2]) {
-    process.stderr.write('Usage: node pack.mjs <outputDir> [archivePath]\n');
+if (isMain(import.meta.url)) {
+  const args = process.argv.slice(2);
+  const maxIndex = args.indexOf('--max-bytes');
+  const maxBytes = maxIndex >= 0 ? Number(args.splice(maxIndex, 2)[1]) : LIMITS.maxArchiveBytes;
+  if (!args[0] || !Number.isFinite(maxBytes) || maxBytes <= 0) {
+    process.stderr.write('Usage: node pack.mjs <outputDir> [archivePath] [--max-bytes N]\n');
     process.exit(1);
   }
-  pack(process.argv[2], process.argv[3]).then(
+  pack(args[0], args[1], { maxBytes }).then(
     (result) => process.stdout.write(`${JSON.stringify(result, null, 2)}\n`),
     (error) => {
-      process.stdout.write(`${JSON.stringify({ error: error.message })}\n`);
+      const { code = 'PACK_FAILED', bytes, max_bytes: max } = error;
+      process.stdout.write(`${JSON.stringify({ error: error.message, code, ...(bytes ? { bytes, max_bytes: max } : {}) })}\n`);
       process.exit(1);
     },
   );

@@ -5,7 +5,7 @@
 
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { isMain, outputDirProblem } from './rules.mjs';
 
 const read = (dir, file) => {
   try {
@@ -67,11 +67,7 @@ function result(base) {
   };
 }
 
-export function detect(projectDir = '.') {
-  const dir = resolve(projectDir);
-  if (!existsSync(dir) || !statSync(dir).isDirectory()) {
-    return result({ reason: `The folder ${dir} does not exist.` });
-  }
+function detectFramework(dir) {
   const pkgText = read(dir, 'package.json');
   let pkg = null;
   if (pkgText) {
@@ -92,6 +88,28 @@ export function detect(projectDir = '.') {
   const requirements = read(dir, 'requirements.txt') ?? '';
   if (/\b(django|flask|fastapi|streamlit|gradio)\b/i.test(pyproject + requirements) || existsSync(join(dir, 'manage.py'))) {
     return result({ framework: 'python', reason: 'This is a Python web app. soll.net web hosting runs static sites and PHP, not Python servers.', notes: ['Host the Python backend elsewhere (e.g. a PaaS) and publish only a static frontend here.'] });
+  }
+
+  // PHP frameworks with a public/ web root (Laravel, Symfony) do not fit a single web folder. Checked before the
+  // JavaScript tools, because such apps often build their assets with Vite.
+  const composerText = read(dir, 'composer.json') ?? '';
+  if (existsSync(join(dir, 'artisan')) || existsSync(join(dir, 'bin', 'console')) || existsSync(join(dir, 'symfony.lock'))
+    || /"(laravel\/framework|symfony\/framework-bundle)"\s*:/.test(composerText)) {
+    return result({ framework: 'php-framework', reason: 'Laravel/Symfony apps need their public/ folder as the web root and their code outside of it. Publishing through this plugin would put the whole app, including .env, in the web folder.', notes: ['Ask soll.net support for a hosting setup with a separate web root.'] });
+  }
+
+  // Full-stack frameworks that render on a server (static or SPA modes exist, but need their own configuration).
+  const ssr = [
+    ['@tanstack/react-start', 'TanStack Start'], ['@tanstack/solid-start', 'TanStack Start'], ['@tanstack/start', 'TanStack Start'],
+    ['@solidjs/start', 'SolidStart'], ['vike', 'Vike'], ['vite-plugin-ssr', 'Vike'], ['@analogjs/platform', 'Analog'],
+    ['@builder.io/qwik-city', 'Qwik City'], ['@qwik.dev/router', 'Qwik City'],
+  ].find(([name]) => has(name));
+  if (ssr) {
+    return result({
+      ...base, framework: ssr[1].toLowerCase().replace(/\s+/g, '-'),
+      reason: `This ${ssr[1]} app renders pages on a Node.js server. soll.net web hosting serves static files and PHP only.`,
+      notes: [`${ssr[1]} can prerender a static site or build a single-page app (see its docs for static/prerender or SPA mode). After such a build, tell me the folder with index.html and I'll publish it.`],
+    });
   }
 
   // Next.js: only a static export works.
@@ -188,6 +206,18 @@ export function detect(projectDir = '.') {
     return result({ ...base, framework: 'angular', supported: true, kind: 'spa', build_command: runScript(pm, 'build'), output_dir: output, spa_fallback: true, reason: 'Angular browser build.', notes: ['Check that the output folder contains index.html; older Angular versions build to dist/<project> without /browser.'] });
   }
 
+  // Static site generators and bundlers that build from a root index.html or templates.
+  if (has('@11ty/eleventy')) {
+    const config = read(dir, firstExisting(dir, ['eleventy.config.js', 'eleventy.config.mjs', 'eleventy.config.cjs', '.eleventy.js']) ?? '') ?? '';
+    const output = config.match(/output\s*:\s*['"`]([^'"`]+)['"`]/)?.[1];
+    return result({ ...base, framework: 'eleventy', supported: true, kind: 'static', build_command: scripts.build ? runScript(pm, 'build') : 'npx @11ty/eleventy', output_dir: output ?? '_site', reason: 'Eleventy static site.' });
+  }
+  if (has('parcel') || has('parcel-bundler')) {
+    const entry = firstExisting(dir, ['index.html', 'src/index.html']) ?? 'index.html';
+    const distDir = (scripts.build ?? '').match(/--dist-dir[ =]([^\s]+)/)?.[1];
+    return result({ ...base, framework: 'parcel', supported: true, kind: 'static', build_command: scripts.build ? runScript(pm, 'build') : `npx parcel build ${entry}`, output_dir: distDir ?? 'dist', reason: 'Parcel build.', notes: ['Check that the build output has index.html at the top.'] });
+  }
+
   if (has('vite')) {
     const config = read(dir, firstExisting(dir, ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) ?? '') ?? '';
     const outDir = config.match(/outDir\s*:\s*['"`]([^'"`]+)['"`]/)?.[1];
@@ -211,10 +241,7 @@ export function detect(projectDir = '.') {
     return result({ ...base, framework: 'node-server', reason: `This is a Node.js server app (${server}). soll.net web hosting runs static sites and PHP, not Node.js servers.`, notes: ['Host the server on a Node.js platform; a static frontend of it can be published here.'] });
   }
 
-  // PHP: plain PHP sites run; frameworks with a public/ web root (Laravel, Symfony) do not fit a single web folder.
-  if (existsSync(join(dir, 'artisan')) || existsSync(join(dir, 'bin', 'console')) || existsSync(join(dir, 'symfony.lock'))) {
-    return result({ framework: 'php-framework', reason: 'Laravel/Symfony apps need their public/ folder as the web root and their code outside of it. Publishing through this plugin would put the whole app, including .env, in the web folder.', notes: ['Ask soll.net support for a hosting setup with a separate web root.'] });
-  }
+  // PHP: plain PHP sites run (frameworks with their own web root are refused above).
   const phpFiles = findFiles(dir, (path, name) => name.endsWith('.php'), 1);
   if (phpFiles.length > 0) {
     const composer = existsSync(join(dir, 'composer.json'));
@@ -225,9 +252,18 @@ export function detect(projectDir = '.') {
     });
   }
 
+  // Jekyll: templates in the root; the built site is _site/.
+  const gemfile = read(dir, 'Gemfile') ?? '';
+  if (/\bjekyll\b|github-pages/.test(gemfile) || (existsSync(join(dir, '_config.yml')) && (existsSync(join(dir, '_layouts')) || existsSync(join(dir, '_posts')) || existsSync(join(dir, '_includes'))))) {
+    return result({ framework: 'jekyll', supported: true, kind: 'static', install_command: gemfile ? 'bundle install' : null, build_command: gemfile ? 'bundle exec jekyll build' : 'jekyll build', output_dir: '_site', reason: 'Jekyll static site (needs Ruby and Jekyll to build).' });
+  }
+
   // Plain HTML.
   if (existsSync(join(dir, 'index.html'))) {
-    return result({ framework: 'static-html', supported: true, kind: 'static', output_dir: '.', reason: 'Plain HTML site.' });
+    return result({
+      framework: 'static-html', supported: true, kind: 'static', output_dir: '.', reason: 'Plain HTML site.',
+      notes: pkg && scripts.build ? ['package.json has a build script: if it builds the site, publish its output folder instead of the project folder (tell me which).'] : [],
+    });
   }
   if (!pkg && existsSync(join(dir, 'public', 'index.html'))) {
     return result({ framework: 'static-html', supported: true, kind: 'static', output_dir: 'public', reason: 'Plain HTML site in public/.' });
@@ -238,6 +274,23 @@ export function detect(projectDir = '.') {
   return result({ reason: 'No website found: no index.html, no PHP files and no known framework.' });
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+/**
+ * The framework of a project and whether soll.net can run it. An output_dir (also one read from the project's own
+ * config) must lie inside the project and must not be the home folder; otherwise the result is refused.
+ */
+export function detect(projectDir = '.') {
+  const dir = resolve(projectDir);
+  if (!existsSync(dir) || !statSync(dir).isDirectory()) {
+    return result({ reason: `The folder ${dir} does not exist.` });
+  }
+  const found = detectFramework(dir);
+  if (found.output_dir !== null) {
+    const problem = outputDirProblem(found.output_dir, dir);
+    if (problem) return { ...found, supported: false, reason: problem, notes: ['Set the build output folder to one inside the project.'] };
+  }
+  return found;
+}
+
+if (isMain(import.meta.url)) {
   process.stdout.write(`${JSON.stringify(detect(process.argv[2] ?? '.'), null, 2)}\n`);
 }
