@@ -1,7 +1,7 @@
 {
   "name": "soll",
   "displayName": "soll.net Publish",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Publish websites and web apps built with AI to soll.net web hosting with one sentence: framework detection, secret scan, upload, live URL, rollback.",
   "author": { "name": "Soll IT Consulting", "email": "support@soll.net", "url": "https://soll.net/" },
   "homepage": "https://soll.net/",

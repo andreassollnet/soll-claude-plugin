@@ -7,7 +7,7 @@
       "name": "soll",
       "source": "./",
       "description": "Publish websites and web apps to soll.net web hosting with one sentence.",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "category": "deployment"
     }
   ]
